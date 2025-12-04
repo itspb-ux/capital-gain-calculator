@@ -113,6 +113,7 @@ def process_merged_dataframe(
     purchase price (Pur. Price) as present in the data. Grandfathering only affects
     how gains/losses are allocated between Short Term and Long Term (COL_SHORT / COL_LONG).
     Negative ST/LT values (losses) are preserved and shown.
+    NOTE: adjusted cost for allocation is NOT capped at sale price here (so allocation can be negative).
     """
     df = df.copy()
     df = normalize_column_names(df)
@@ -217,13 +218,11 @@ def process_merged_dataframe(
                         lot = buy_queue[0]
                         take_qty = min(qty_to_sell, lot["qty"])
 
-                        # compute adjusted cost for allocation (but do NOT change COL_CAP_GAIN)
+                        # compute adjusted cost for allocation (do NOT cap at sale price so losses remain negative)
                         adjusted_cost = lot["orig_buy_price"]
                         if apply_grandfather and row_fmv is not None:
                             adjusted_cost = max(adjusted_cost, row_fmv)
-                        # cap adjusted cost at sale price per share
-                        if pd.notna(sale_price):
-                            adjusted_cost = min(adjusted_cost, float(sale_price))
+                        # NOTE: we DO NOT min(adjusted_cost, sale_price) here — allow negative allocation
 
                         gain_for_allocation = (float(sale_price) - adjusted_cost) * take_qty
 
@@ -252,8 +251,7 @@ def process_merged_dataframe(
                         adjusted_cost = orig_cost_basis
                         if apply_grandfather and row_fmv is not None:
                             adjusted_cost = max(adjusted_cost, row_fmv)
-                        if pd.notna(sale_price):
-                            adjusted_cost = min(adjusted_cost, float(sale_price))
+                        # DO NOT cap adjusted_cost at sale_price here
 
                         gain_for_allocation = (float(sale_price) - adjusted_cost) * qty_to_sell
 
@@ -303,10 +301,7 @@ def process_merged_dataframe(
             if apply_grandfather and row_fmv is not None:
                 adjusted_cost = max(adjusted_cost, row_fmv)
 
-            # cap adjusted_cost at sale price per share if sale price present
-            if pd.notna(sp):
-                adjusted_cost = min(adjusted_cost, float(sp))
-
+            # NOTE: DO NOT cap adjusted_cost at sale price — allow (sp - adjusted_cost) to be negative
             gain_for_allocation = (float(sp) - adjusted_cost) * q
 
             # allow negative ST/LT values (losses)
