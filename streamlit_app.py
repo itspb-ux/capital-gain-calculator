@@ -23,7 +23,7 @@ FMV_CANDIDATES = [
     "FMV_31_01_2018",
     "FMV_31-01-2018",
     "FMV on 31 Jan 2018",
-    "FMV Price on 31-Jan-2018",   # matches your header after normalization
+    "FMV Price on 31-Jan-2018",   # matches "FMV Price on\n31-Jan-2018" after normalization
     "FMV Price on 31 Jan 2018",
 ]
 
@@ -32,6 +32,7 @@ def normalize_column_names(df: pd.DataFrame) -> pd.DataFrame:
     """
     Collapse any newlines / multiple spaces in column names into a single space
     and strip leading/trailing spaces.
+    Example: 'FMV Price on\\n31-Jan-2018' -> 'FMV Price on 31-Jan-2018'
     """
     df.columns = [
         re.sub(r"\s+", " ", str(col)).strip()
@@ -110,7 +111,8 @@ def process_merged_dataframe(
 
     IMPORTANT: COL_CAP_GAIN (Capital Gain) is always computed using the original
     purchase price (Pur. Price) as present in the data. Grandfathering only affects
-    how gains are allocated between Short Term and Long Term (COL_SHORT / COL_LONG).
+    how gains/losses are allocated between Short Term and Long Term (COL_SHORT / COL_LONG).
+    Negative ST/LT values (losses) are preserved and shown.
     """
     df = df.copy()
     df = normalize_column_names(df)
@@ -174,7 +176,7 @@ def process_merged_dataframe(
             g = g.sort_values("_tx_date").reset_index(drop=True)
 
             # FIFO buy queue
-            buy_queue = []  # each: {"qty", "buy_price", "buy_date", "orig_buy_price"}
+            buy_queue = []  # each: {"qty", "orig_buy_price", "buy_date"}
             st_map = {}
             lt_map = {}
 
@@ -215,12 +217,12 @@ def process_merged_dataframe(
                         lot = buy_queue[0]
                         take_qty = min(qty_to_sell, lot["qty"])
 
-                        # For classification, compute adjusted per-share cost:
+                        # compute adjusted cost for allocation (but do NOT change COL_CAP_GAIN)
                         adjusted_cost = lot["orig_buy_price"]
-                        if apply_grandfather:
-                            if row_fmv is not None:
-                                adjusted_cost = max(adjusted_cost, row_fmv)
-                            # cap at sale price per share
+                        if apply_grandfather and row_fmv is not None:
+                            adjusted_cost = max(adjusted_cost, row_fmv)
+                        # cap adjusted cost at sale price per share
+                        if pd.notna(sale_price):
                             adjusted_cost = min(adjusted_cost, float(sale_price))
 
                         gain_for_allocation = (float(sale_price) - adjusted_cost) * take_qty
@@ -233,12 +235,12 @@ def process_merged_dataframe(
                             except Exception:
                                 hd = None
 
+                        # allow negative numbers: allocate gain_for_allocation (can be negative)
                         if hd is not None and hd > LONG_TERM_DAYS:
                             lt_map[orig_idx] += gain_for_allocation
                         else:
                             st_map[orig_idx] += gain_for_allocation
 
-                        # reduce lot qty
                         lot["qty"] -= take_qty
                         qty_to_sell -= take_qty
                         if lot["qty"] <= 0:
@@ -250,7 +252,9 @@ def process_merged_dataframe(
                         adjusted_cost = orig_cost_basis
                         if apply_grandfather and row_fmv is not None:
                             adjusted_cost = max(adjusted_cost, row_fmv)
-                        adjusted_cost = min(adjusted_cost, float(sale_price))
+                        if pd.notna(sale_price):
+                            adjusted_cost = min(adjusted_cost, float(sale_price))
+
                         gain_for_allocation = (float(sale_price) - adjusted_cost) * qty_to_sell
 
                         hd = None
@@ -299,11 +303,13 @@ def process_merged_dataframe(
             if apply_grandfather and row_fmv is not None:
                 adjusted_cost = max(adjusted_cost, row_fmv)
 
-            # cap adjusted_cost at sale price per share
-            adjusted_cost = min(adjusted_cost, float(sp))
+            # cap adjusted_cost at sale price per share if sale price present
+            if pd.notna(sp):
+                adjusted_cost = min(adjusted_cost, float(sp))
 
             gain_for_allocation = (float(sp) - adjusted_cost) * q
 
+            # allow negative ST/LT values (losses)
             if pd.notna(hd) and hd > LONG_TERM_DAYS:
                 short_val, long_val = 0.0, gain_for_allocation
             else:
