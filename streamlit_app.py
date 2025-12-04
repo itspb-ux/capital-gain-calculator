@@ -4,21 +4,6 @@ import pandas as pd
 from io import BytesIO
 import re
 
-# ----- Helpers -----
-def normalize_column_names(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Normalize columns by:
-      - replacing any whitespace/newlines with a single space
-      - stripping leading/trailing spaces
-    This turns 'FMV Price on\\n31-Jan-2018' into 'FMV Price on 31-Jan-2018'.
-    """
-    df.columns = [
-        re.sub(r"\s+", " ", str(col)).strip()
-        for col in df.columns
-    ]
-    return df
-
-
 # ----- Constants / Column names -----
 COL_ISIN = "ISIN"
 COL_SALE_DATE = "Sale Date"
@@ -31,16 +16,28 @@ COL_LONG = "Long Term"
 COL_CAP_GAIN = "Capital Gain"
 LONG_TERM_DAYS = 365
 
-# FMV header candidates (after normalization)
+# possible FMV column names (after normalization)
 FMV_CANDIDATES = [
     "FMV",
     "FMV_31Jan2018",
     "FMV_31_01_2018",
     "FMV_31-01-2018",
     "FMV on 31 Jan 2018",
-    "FMV Price on 31-Jan-2018",   # your header becomes this after normalization
+    "FMV Price on 31-Jan-2018",   # matches your header after normalization
     "FMV Price on 31 Jan 2018",
 ]
+
+
+def normalize_column_names(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Collapse any newlines / multiple spaces in column names into a single space
+    and strip leading/trailing spaces.
+    """
+    df.columns = [
+        re.sub(r"\s+", " ", str(col)).strip()
+        for col in df.columns
+    ]
+    return df
 
 
 def build_fmv_map_from_df(
@@ -48,22 +45,20 @@ def build_fmv_map_from_df(
     isin_col_candidates=None,
     fmv_col_candidates=None,
 ):
-    """
-    Build a dict ISIN -> FMV from a mapping sheet.
-    """
+    """Build dict: ISIN -> FMV value from a mapping sheet."""
     if isin_col_candidates is None:
         isin_col_candidates = [COL_ISIN, "ISIN", "isin", "Ticker", "Symbol"]
     if fmv_col_candidates is None:
         fmv_col_candidates = FMV_CANDIDATES
 
+    df_map = normalize_column_names(df_map)
+
     isin_col = None
     fmv_col = None
-
     for c in isin_col_candidates:
         if c in df_map.columns:
             isin_col = c
             break
-
     for c in fmv_col_candidates:
         if c in df_map.columns:
             fmv_col = c
@@ -88,11 +83,9 @@ def build_fmv_map_from_df(
 def find_fmv_for_row(row, fmv_map, fmv_col_candidates=FMV_CANDIDATES):
     """
     Return FMV for a row:
-      1) Prefer any FMV column present in this row.
-      2) Else, lookup by ISIN in fmv_map.
-      3) Else, None.
+      1) Look for an FMV column directly in this row.
+      2) If not found, look up in fmv_map using ISIN.
     """
-    # 1) direct FMV column on row
     for c in fmv_col_candidates:
         if c in row.index and pd.notna(row[c]):
             try:
@@ -100,7 +93,6 @@ def find_fmv_for_row(row, fmv_map, fmv_col_candidates=FMV_CANDIDATES):
             except Exception:
                 continue
 
-    # 2) mapping by ISIN
     isin = str(row.get(COL_ISIN, "")).strip()
     if isin and isin in fmv_map:
         return float(fmv_map[isin])
@@ -116,61 +108,75 @@ def process_merged_dataframe(
     """
     Processor with optional Grandfathering (31-Jan-2018).
 
-    - If apply_grandfather=True and FMV data is available, cost basis is:
-          cost = min( max(actual_buy_price, FMV_31Jan2018), sale_price )
-
-    - Supports:
-        * FIFO mode when there is a 'Type' column (BUY / SELL).
-        * Simple per-row mode when there is no 'Type' column.
+    IMPORTANT: COL_CAP_GAIN (Capital Gain) is always computed using the original
+    purchase price (Pur. Price) as present in the data. Grandfathering only affects
+    how gains are allocated between Short Term and Long Term (COL_SHORT / COL_LONG).
     """
     df = df.copy()
     df = normalize_column_names(df)
-    df.columns = [str(c).strip() for c in df.columns]
 
-    # quantity column detection
+    # detect quantity column
     qty_col_candidates = [COL_QTY, "Qty", "Quantity", "Quantity Sold"]
+    qty_col = None
     for c in qty_col_candidates:
         if c in df.columns:
             qty_col = c
             break
-    else:
-        qty_col = COL_QTY  # default; may be empty
+    if qty_col is None:
+        qty_col = COL_QTY  # create/assume
 
-    # ensure necessary columns exist
+    # ensure required columns exist
     for col in (COL_SALE_DATE, COL_PUR_DATE, qty_col, COL_SALE_PRICE, COL_PUR_PRICE):
         if col not in df.columns:
             df[col] = pd.NA
 
-    # parse core columns
+    # parse datetimes and numerics
     df[COL_SALE_DATE] = pd.to_datetime(df.get(COL_SALE_DATE), errors="coerce")
     df[COL_PUR_DATE] = pd.to_datetime(df.get(COL_PUR_DATE), errors="coerce")
     df[qty_col] = pd.to_numeric(df.get(qty_col), errors="coerce").fillna(0.0)
     df[COL_SALE_PRICE] = pd.to_numeric(df.get(COL_SALE_PRICE), errors="coerce")
     df[COL_PUR_PRICE] = pd.to_numeric(df.get(COL_PUR_PRICE), errors="coerce")
 
-    # output columns
-    df[COL_SHORT] = 0.0
-    df[COL_LONG] = 0.0
-    df[COL_CAP_GAIN] = 0.0
+    # holding days (row-level, for simple mode)
     df["Holding Days"] = (df[COL_SALE_DATE] - df[COL_PUR_DATE]).dt.days
 
-    if "Type" in df.columns:
-        df["Type_norm"] = df["Type"].astype(str).str.strip().str.upper()
+    # output columns: initialize
+    df[COL_SHORT] = 0.0
+    df[COL_LONG] = 0.0
+
+    # IMPORTANT: compute Capital Gain (unchanged by grandfathering) using original Pur. Price
+    # For rows where data missing, capgain is 0
+    cap_gain_list = []
+    for _, row in df.iterrows():
+        q = float(row.get(qty_col) or 0.0)
+        sp = row.get(COL_SALE_PRICE)
+        pp = row.get(COL_PUR_PRICE)
+        if q == 0 or pd.isna(sp) or pd.isna(pp):
+            cap_gain_list.append(0.0)
+        else:
+            cap_gain_list.append(round((float(sp) - float(pp)) * q, 2))
+    df[COL_CAP_GAIN] = cap_gain_list
 
     if fmv_map is None:
         fmv_map = {}
 
-    # -------- FIFO MODE (if 'Type' column exists) --------
-    if "Type" in df.columns:
+    # normalize Type column if present
+    has_type = "Type" in df.columns
+    if has_type:
+        df["Type_norm"] = df["Type"].astype(str).str.strip().str.upper()
+
+    # ---------- FIFO mode (Type column exists) ----------
+    if has_type:
         for isin, group in df.groupby(COL_ISIN, sort=False):
-            g = group.copy().reset_index()  # 'index' is original df index
+            g = group.copy().reset_index()  # original row index in 'index'
+            # transaction date: sale or purchase date
             g["_tx_date"] = g[COL_SALE_DATE].fillna(g[COL_PUR_DATE])
             g = g.sort_values("_tx_date").reset_index(drop=True)
 
-            buy_queue = []  # list of dicts: {qty, buy_price, buy_date}
+            # FIFO buy queue
+            buy_queue = []  # each: {"qty", "buy_price", "buy_date", "orig_buy_price"}
             st_map = {}
             lt_map = {}
-            tot_map = {}
 
             for _, r in g.iterrows():
                 orig_idx = r["index"]
@@ -183,19 +189,18 @@ def process_merged_dataframe(
 
                 st_map[orig_idx] = 0.0
                 lt_map[orig_idx] = 0.0
-                tot_map[orig_idx] = 0.0
 
+                # FMV for this row/ISIN (if any)
                 row_fmv = find_fmv_for_row(r, fmv_map)
 
                 if rtype.startswith("B"):  # BUY
                     if qty > 0:
-                        lot_cost = float(buy_price) if pd.notna(buy_price) else 0.0
-                        if apply_grandfather and row_fmv is not None:
-                            lot_cost = max(lot_cost, row_fmv)
+                        # store original buy price separately (orig_buy_price) to preserve Capital Gain calc later
+                        orig_buy = float(buy_price) if pd.notna(buy_price) else 0.0
                         buy_queue.append(
                             {
                                 "qty": qty,
-                                "buy_price": lot_cost,
+                                "orig_buy_price": orig_buy,
                                 "buy_date": buy_date if pd.notna(buy_date) else pd.NaT,
                             }
                         )
@@ -205,13 +210,22 @@ def process_merged_dataframe(
                     if qty_to_sell <= 0 or pd.isna(sale_price) or pd.isna(sale_date):
                         continue
 
-                    # consume buy lots FIFO
-                    while qty_to_sell > 0 and buy_queue:
+                    # consume existing buys (FIFO). For ST/LT allocation, use adjusted cost if grandfathering is enabled.
+                    while qty_to_sell > 0 and len(buy_queue) > 0:
                         lot = buy_queue[0]
                         take_qty = min(qty_to_sell, lot["qty"])
-                        buy_p = lot["buy_price"]
-                        gain = (sale_price - buy_p) * take_qty
 
+                        # For classification, compute adjusted per-share cost:
+                        adjusted_cost = lot["orig_buy_price"]
+                        if apply_grandfather:
+                            if row_fmv is not None:
+                                adjusted_cost = max(adjusted_cost, row_fmv)
+                            # cap at sale price per share
+                            adjusted_cost = min(adjusted_cost, float(sale_price))
+
+                        gain_for_allocation = (float(sale_price) - adjusted_cost) * take_qty
+
+                        # holding period per lot
                         hd = None
                         if pd.notna(lot["buy_date"]) and pd.notna(sale_date):
                             try:
@@ -220,22 +234,24 @@ def process_merged_dataframe(
                                 hd = None
 
                         if hd is not None and hd > LONG_TERM_DAYS:
-                            lt_map[orig_idx] += gain
+                            lt_map[orig_idx] += gain_for_allocation
                         else:
-                            st_map[orig_idx] += gain
-                        tot_map[orig_idx] += gain
+                            st_map[orig_idx] += gain_for_allocation
 
+                        # reduce lot qty
                         lot["qty"] -= take_qty
                         qty_to_sell -= take_qty
                         if lot["qty"] <= 0:
                             buy_queue.pop(0)
 
-                    # unmatched SELL quantity (no or insufficient buys)
+                    # unmatched sell qty (no buys) — allocate using row-level buy price (orig)
                     if qty_to_sell > 0:
-                        cost_basis = float(buy_price) if pd.notna(buy_price) else 0.0
+                        orig_cost_basis = float(buy_price) if pd.notna(buy_price) else 0.0
+                        adjusted_cost = orig_cost_basis
                         if apply_grandfather and row_fmv is not None:
-                            cost_basis = max(cost_basis, row_fmv)
-                        gain = (sale_price - cost_basis) * qty_to_sell
+                            adjusted_cost = max(adjusted_cost, row_fmv)
+                        adjusted_cost = min(adjusted_cost, float(sale_price))
+                        gain_for_allocation = (float(sale_price) - adjusted_cost) * qty_to_sell
 
                         hd = None
                         if pd.notna(buy_date) and pd.notna(sale_date):
@@ -245,26 +261,24 @@ def process_merged_dataframe(
                                 hd = None
 
                         if hd is not None and hd > LONG_TERM_DAYS:
-                            lt_map[orig_idx] += gain
+                            lt_map[orig_idx] += gain_for_allocation
                         else:
-                            st_map[orig_idx] += gain
-                        tot_map[orig_idx] += gain
+                            st_map[orig_idx] += gain_for_allocation
 
-            # write back
+                        qty_to_sell = 0.0
+
+            # write back ST/LT using original indices
             for idx_key, v in st_map.items():
                 df.loc[idx_key, COL_SHORT] = round(v, 2)
             for idx_key, v in lt_map.items():
                 df.loc[idx_key, COL_LONG] = round(v, 2)
-            for idx_key, v in tot_map.items():
-                df.loc[idx_key, COL_CAP_GAIN] = round(v, 2)
 
         df = df.drop(columns=["Type_norm", "_tx_date"], errors="ignore")
 
-    # -------- SIMPLE PER-ROW MODE (no 'Type' column) --------
+    # ---------- Simple per-row mode (no Type column) ----------
     else:
         short_list = []
         long_list = []
-        total_list = []
 
         for _, row in df.iterrows():
             q = float(row.get(qty_col) or 0.0)
@@ -272,40 +286,36 @@ def process_merged_dataframe(
             pp = row.get(COL_PUR_PRICE)
             hd = row.get("Holding Days")
 
-            row_fmv = find_fmv_for_row(row, fmv_map)
-
             if q == 0 or pd.isna(sp) or pd.isna(pp):
                 short_list.append(0.0)
                 long_list.append(0.0)
-                total_list.append(0.0)
                 continue
 
-            cost_basis = float(pp)
+            # FMV for this row if any
+            row_fmv = find_fmv_for_row(row, fmv_map)
+
+            # For ST/LT allocation, compute adjusted cost (if grandfathering) else use pp
+            adjusted_cost = float(pp)
             if apply_grandfather and row_fmv is not None:
-                cost_basis = max(cost_basis, row_fmv)
+                adjusted_cost = max(adjusted_cost, row_fmv)
 
-            # cost basis cannot exceed sale price
-            try:
-                cost_basis = min(cost_basis, float(sp))
-            except Exception:
-                pass
+            # cap adjusted_cost at sale price per share
+            adjusted_cost = min(adjusted_cost, float(sp))
 
-            gain = (float(sp) - cost_basis) * q
+            gain_for_allocation = (float(sp) - adjusted_cost) * q
 
             if pd.notna(hd) and hd > LONG_TERM_DAYS:
-                st_val, lt_val = 0.0, gain
+                short_val, long_val = 0.0, gain_for_allocation
             else:
-                st_val, lt_val = gain, 0.0
+                short_val, long_val = gain_for_allocation, 0.0
 
-            short_list.append(round(st_val, 2))
-            long_list.append(round(lt_val, 2))
-            total_list.append(round(gain, 2))
+            short_list.append(round(short_val, 2))
+            long_list.append(round(long_val, 2))
 
         df[COL_SHORT] = short_list
         df[COL_LONG] = long_list
-        df[COL_CAP_GAIN] = total_list
 
-    # final date formatting
+    # format dates for output
     for col in [COL_SALE_DATE, COL_PUR_DATE]:
         df[col] = pd.to_datetime(df[col], errors="coerce").dt.strftime("%d/%m/%Y")
 
@@ -321,53 +331,55 @@ st.set_page_config(
 st.title("Capital Gain Calculator")
 st.write(
     "Upload one or more Excel/CSV files. "
-    "They will be merged and Short/Long term capital gains will be calculated."
+    "The app will merge them, apply FIFO (if BUY/SELL available) or simple per-row "
+    "calculation, and compute Short-Term and Long-Term capital gains. "
+    "Optionally, apply the Grandfathering clause using FMV as on 31-Jan-2018."
 )
 
-# --- Grandfathering section ---
+# --- Grandfathering controls ---
 st.markdown("### Grandfathering (31-Jan-2018)")
 apply_grandfather = st.checkbox(
-    "Apply Grandfathering using FMV as on 31-Jan-2018"
+    "Apply Grandfathering (use FMV as on 31-Jan-2018)",
+    value=False,
 )
 
 fmv_map = {}
 if apply_grandfather:
     st.info(
-        "The app will look for an FMV column in your data "
-        "(for example 'FMV Price on 31-Jan-2018'). "
-        "You can also upload a separate mapping file (ISIN → FMV)."
+        "To apply grandfathering, the app looks for an FMV column in your main files "
+        "(e.g. 'FMV Price on 31-Jan-2018'). "
+        "You can also upload a separate mapping file with ISIN and FMV columns."
     )
+
     fmv_file = st.file_uploader(
-        "Optional: Upload ISIN → FMV mapping file (Excel/CSV)",
+        "Optional: Upload ISIN → FMV mapping (Excel/CSV)",
         type=["xlsx", "xls", "csv"],
-        key="fmv_file",
+        key="fmv_mapping",
     )
+
     if fmv_file is not None:
         try:
             if fmv_file.name.lower().endswith(".csv"):
                 map_df = pd.read_csv(fmv_file)
             else:
                 map_df = pd.read_excel(fmv_file, header=0)
-            map_df = normalize_column_names(map_df)
             fmv_map = build_fmv_map_from_df(map_df)
             if not fmv_map:
                 st.warning(
-                    "Could not detect ISIN and FMV columns in the mapping file. "
-                    "Make sure it has 'ISIN' and an FMV column."
+                    "Could not find suitable ISIN and FMV columns in the mapping file. "
+                    "Make sure it has an ISIN column and an FMV column."
                 )
             else:
-                st.success(
-                    f"Loaded FMV mapping for {len(fmv_map)} ISIN(s)."
-                )
+                st.success(f"Loaded FMV mapping for {len(fmv_map)} ISIN(s).")
         except Exception as e:
             st.error(f"Error reading FMV mapping file: {e}")
 
 # --- Main file uploader ---
 uploaded = st.file_uploader(
-    "Select Excel/CSV files to merge & process",
+    "Select trade files to merge & process (Excel/CSV)",
     accept_multiple_files=True,
     type=["xlsx", "xls", "csv"],
-    key="data_files",
+    key="main_files",
 )
 
 if uploaded:
@@ -382,18 +394,17 @@ if uploaded:
             dfs.append(df)
 
         merged = pd.concat(dfs, ignore_index=True)
-        st.subheader("Merged data preview")
+        st.subheader("Merged preview")
         st.dataframe(merged.head(50))
 
         if st.button("Process & Download Excel"):
+            # check if merged files themselves contain FMV columns
             merged_fmv_cols = [c for c in merged.columns if c in FMV_CANDIDATES]
-            merged_has_fmv = len(merged_fmv_cols) > 0
-
-            if apply_grandfather and (not merged_has_fmv) and (not fmv_map):
+            if apply_grandfather and (not merged_fmv_cols) and (not fmv_map):
                 st.warning(
-                    "Grandfathering is selected but no FMV column was found in "
-                    "the uploaded data and no mapping file was provided. "
-                    "Processing will continue **without** applying FMV."
+                    "Grandfathering is selected but no FMV column was found in the uploaded "
+                    "files and no FMV mapping file was provided. "
+                    "Processing will continue WITHOUT applying grandfathering."
                 )
 
             result_df = process_merged_dataframe(
@@ -405,6 +416,7 @@ if uploaded:
             st.subheader("Processed preview")
             st.dataframe(result_df.head(50))
 
+            # prepare Excel for download
             output = BytesIO()
             with pd.ExcelWriter(output, engine="openpyxl") as writer:
                 result_df.to_excel(writer, index=False, sheet_name="Processed")
@@ -415,13 +427,11 @@ if uploaded:
                 data=output,
                 file_name="Merged_with_gains.xlsx",
                 mime=(
-                    "application/"
-                    "vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+                    "application/vnd.openxmlformats-officedocument."
+                    "spreadsheetml.sheet"
                 ),
             )
     except Exception as e:
         st.error(f"Error processing files: {e}")
 else:
-    st.info(
-        "No files uploaded yet. Select one or more Excel/CSV files from your computer."
-    )
+    st.info("No files uploaded yet. Select one or more Excel/CSV files to begin.")
