@@ -41,51 +41,11 @@ def normalize_column_names(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
-def build_fmv_map_from_df(
-    df_map: pd.DataFrame,
-    isin_col_candidates=None,
-    fmv_col_candidates=None,
-):
-    """Build dict: ISIN -> FMV value from a mapping sheet."""
-    if isin_col_candidates is None:
-        isin_col_candidates = [COL_ISIN, "ISIN", "isin", "Ticker", "Symbol"]
-    if fmv_col_candidates is None:
-        fmv_col_candidates = FMV_CANDIDATES
-
-    df_map = normalize_column_names(df_map)
-
-    isin_col = None
-    fmv_col = None
-    for c in isin_col_candidates:
-        if c in df_map.columns:
-            isin_col = c
-            break
-    for c in fmv_col_candidates:
-        if c in df_map.columns:
-            fmv_col = c
-            break
-
-    if isin_col is None or fmv_col is None:
-        return {}
-
-    tmp = df_map[[isin_col, fmv_col]].dropna()
-    tmp[fmv_col] = pd.to_numeric(tmp[fmv_col], errors="coerce")
-    tmp = tmp.dropna(subset=[fmv_col])
-
-    mapping = dict(
-        zip(
-            tmp[isin_col].astype(str).str.strip(),
-            tmp[fmv_col].astype(float),
-        )
-    )
-    return mapping
-
-
-def find_fmv_for_row(row, fmv_map, fmv_col_candidates=FMV_CANDIDATES):
+def find_fmv_for_row(row, fmv_col_candidates=FMV_CANDIDATES):
     """
     Return FMV for a row:
-      1) Look for an FMV column directly in this row.
-      2) If not found, look up in fmv_map using ISIN.
+      1) Look for an FMV column directly in this row (many candidate names).
+      2) If not found, return None (we no longer accept an external mapping).
     """
     for c in fmv_col_candidates:
         if c in row.index and pd.notna(row[c]):
@@ -93,18 +53,12 @@ def find_fmv_for_row(row, fmv_map, fmv_col_candidates=FMV_CANDIDATES):
                 return float(row[c])
             except Exception:
                 continue
-
-    isin = str(row.get(COL_ISIN, "")).strip()
-    if isin and isin in fmv_map:
-        return float(fmv_map[isin])
-
     return None
 
 
 def process_merged_dataframe(
     df: pd.DataFrame,
     apply_grandfather: bool = False,
-    fmv_map=None,
 ) -> pd.DataFrame:
     """
     Processor with optional Grandfathering (31-Jan-2018).
@@ -160,9 +114,6 @@ def process_merged_dataframe(
             cap_gain_list.append(round((float(sp) - float(pp)) * q, 2))
     df[COL_CAP_GAIN] = cap_gain_list
 
-    if fmv_map is None:
-        fmv_map = {}
-
     # normalize Type column if present
     has_type = "Type" in df.columns
     if has_type:
@@ -193,8 +144,8 @@ def process_merged_dataframe(
                 st_map[orig_idx] = 0.0
                 lt_map[orig_idx] = 0.0
 
-                # FMV for this row/ISIN (if any)
-                row_fmv = find_fmv_for_row(r, fmv_map)
+                # FMV for this row/ISIN (if any) — only from uploaded data
+                row_fmv = find_fmv_for_row(r)
 
                 if rtype.startswith("B"):  # BUY
                     if qty > 0:
@@ -293,8 +244,8 @@ def process_merged_dataframe(
                 long_list.append(0.0)
                 continue
 
-            # FMV for this row if any
-            row_fmv = find_fmv_for_row(row, fmv_map)
+            # FMV for this row if any (only from uploaded data)
+            row_fmv = find_fmv_for_row(row)
 
             # For ST/LT allocation, compute adjusted cost (if grandfathering) else use pp
             adjusted_cost = float(pp)
@@ -334,7 +285,7 @@ st.write(
     "Upload one or more Excel/CSV files. "
     "The app will merge them, apply FIFO (if BUY/SELL available) or simple per-row "
     "calculation, and compute Short-Term and Long-Term capital gains. "
-    "Optionally, apply the Grandfathering clause using FMV as on 31-Jan-2018."
+    "Optionally, apply the Grandfathering clause using an FMV column present in your uploaded files (e.g. 'FMV Price on\\n31-Jan-2018')."
 )
 
 # --- Grandfathering controls ---
@@ -344,40 +295,9 @@ apply_grandfather = st.checkbox(
     value=False,
 )
 
-fmv_map = {}
-if apply_grandfather:
-    st.info(
-        "To apply grandfathering, the app looks for an FMV column in your main files "
-        "(e.g. 'FMV Price on 31-Jan-2018'). "
-        "You can also upload a separate mapping file with ISIN and FMV columns."
-    )
-
-    fmv_file = st.file_uploader(
-        "Optional: Upload ISIN → FMV mapping (Excel/CSV)",
-        type=["xlsx", "xls", "csv"],
-        key="fmv_mapping",
-    )
-
-    if fmv_file is not None:
-        try:
-            if fmv_file.name.lower().endswith(".csv"):
-                map_df = pd.read_csv(fmv_file)
-            else:
-                map_df = pd.read_excel(fmv_file, header=0)
-            fmv_map = build_fmv_map_from_df(map_df)
-            if not fmv_map:
-                st.warning(
-                    "Could not find suitable ISIN and FMV columns in the mapping file. "
-                    "Make sure it has an ISIN column and an FMV column."
-                )
-            else:
-                st.success(f"Loaded FMV mapping for {len(fmv_map)} ISIN(s).")
-        except Exception as e:
-            st.error(f"Error reading FMV mapping file: {e}")
-
-# --- Main file uploader ---
+# --- Main file uploader (no separate FMV mapping) ---
 uploaded = st.file_uploader(
-    "Select trade files to merge & process (Excel/CSV)",
+    "Select trade files to merge & process (Excel/CSV). FMV must be present in these files if you want grandfathering applied.",
     accept_multiple_files=True,
     type=["xlsx", "xls", "csv"],
     key="main_files",
@@ -401,17 +321,15 @@ if uploaded:
         if st.button("Process & Download Excel"):
             # check if merged files themselves contain FMV columns
             merged_fmv_cols = [c for c in merged.columns if c in FMV_CANDIDATES]
-            if apply_grandfather and (not merged_fmv_cols) and (not fmv_map):
+            if apply_grandfather and (not merged_fmv_cols):
                 st.warning(
-                    "Grandfathering is selected but no FMV column was found in the uploaded "
-                    "files and no FMV mapping file was provided. "
-                    "Processing will continue WITHOUT applying grandfathering."
+                    "Grandfathering is selected but no FMV column was found in the uploaded files. "
+                    "Processing will continue WITHOUT applying FMV (grandfathering won't be applied)."
                 )
 
             result_df = process_merged_dataframe(
                 merged,
                 apply_grandfather=apply_grandfather,
-                fmv_map=fmv_map,
             )
 
             st.subheader("Processed preview")
