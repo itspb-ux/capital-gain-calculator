@@ -63,11 +63,14 @@ def process_merged_dataframe(
     """
     Processor with optional Grandfathering (31-Jan-2018).
 
-    IMPORTANT: COL_CAP_GAIN (Capital Gain) is always computed using the original
-    purchase price (Pur. Price) as present in the data. Grandfathering only affects
-    how gains/losses are allocated between Short Term and Long Term (COL_SHORT / COL_LONG).
-    Negative ST/LT values (losses) are preserved and shown.
-    NOTE: adjusted cost for allocation is NOT capped at sale price here (so allocation can be negative).
+    FIFO matching:
+      - For each ISIN, BUY rows are considered in ascending Pur. Date order,
+        but a BUY is only eligible to match a SELL if its Pur. Date <= that SELL's Sale Date.
+      - SELL rows are processed in ascending Sale Date order.
+    Important:
+      - Capital Gain column uses original Pur. Price (unchanged by grandfathering).
+      - ST/LT allocation uses adjusted cost (max(orig_buy_price, FMV)) when grandfathering
+        is enabled; adjusted cost is NOT capped at sale price (so negative allocations allowed).
     """
     df = df.copy()
     df = normalize_column_names(df)
@@ -102,7 +105,6 @@ def process_merged_dataframe(
     df[COL_LONG] = 0.0
 
     # IMPORTANT: compute Capital Gain (unchanged by grandfathering) using original Pur. Price
-    # For rows where data missing, capgain is 0
     cap_gain_list = []
     for _, row in df.iterrows():
         q = float(row.get(qty_col) or 0.0)
@@ -119,108 +121,136 @@ def process_merged_dataframe(
     if has_type:
         df["Type_norm"] = df["Type"].astype(str).str.strip().str.upper()
 
-    # ---------- FIFO mode (Type column exists) ----------
+    # ---------- FIFO by purchase-date mode (Type column exists) ----------
     if has_type:
+        # Process per ISIN
         for isin, group in df.groupby(COL_ISIN, sort=False):
-            g = group.copy().reset_index()  # original row index in 'index'
-            # transaction date: sale or purchase date
-            g["_tx_date"] = g[COL_SALE_DATE].fillna(g[COL_PUR_DATE])
-            g = g.sort_values("_tx_date").reset_index(drop=True)
+            g = group.copy().reset_index()  # keep original index in 'index'
+            # Separate buys and sells
+            buys = g[g["Type_norm"].str.startswith("B", na=False)].copy()
+            sells = g[g["Type_norm"].str.startswith("S", na=False)].copy()
 
-            # FIFO buy queue
-            buy_queue = []  # each: {"qty", "orig_buy_price", "buy_date"}
+            # Normalize date columns for sorting; treat missing Pur. Date as very early (so available)
+            # and missing Sale Date sells will be ignored (can't process).
+            buys["_pur_date_sort"] = buys[COL_PUR_DATE].fillna(pd.Timestamp("1900-01-01"))
+            sells["_sale_date_sort"] = sells[COL_SALE_DATE].fillna(pd.Timestamp("9999-12-31"))
+
+            # sort buys by Pur. Date ascending (FIFO by purchase date)
+            buys = buys.sort_values("_pur_date_sort").reset_index(drop=True)
+            # sort sells by Sale Date ascending (we process sells chronologically)
+            sells = sells.sort_values("_sale_date_sort").reset_index(drop=True)
+
+            # buy_queue holds lots that are eligible for matching (dicts with qty, orig_buy_price, buy_date)
+            buy_queue = []
+            buy_idx = 0  # index into buys dataframe for adding eligible buys
+
+            # maps to accumulate ST/LT per original row index
             st_map = {}
             lt_map = {}
 
-            for _, r in g.iterrows():
-                orig_idx = r["index"]
-                rtype = str(r.get("Type_norm", "")).upper()
-                qty = float(r.get(qty_col) or 0.0)
-                sale_price = r.get(COL_SALE_PRICE)
-                buy_price = r.get(COL_PUR_PRICE)
-                sale_date = r.get(COL_SALE_DATE)
-                buy_date = r.get(COL_PUR_DATE)
+            # initialize maps for all sell rows (so we can write back later even if zero)
+            for _, srow in sells.iterrows():
+                st_map[int(srow["index"])] = 0.0
+                lt_map[int(srow["index"])] = 0.0
 
-                st_map[orig_idx] = 0.0
-                lt_map[orig_idx] = 0.0
+            # iterate through sells in chronological order
+            for _, srow in sells.iterrows():
+                sell_orig_idx = int(srow["index"])
+                sell_qty = float(srow.get(qty_col) or 0.0)
+                sell_price = srow.get(COL_SALE_PRICE)
+                sell_date = srow.get(COL_SALE_DATE)
+                if sell_qty <= 0 or pd.isna(sell_price) or pd.isna(sell_date):
+                    # nothing to compute; keep zeros
+                    continue
 
-                # FMV for this row/ISIN (if any) — only from uploaded data
-                row_fmv = find_fmv_for_row(r)
+                # Add buys whose Pur. Date <= this sell's Sale Date (or with missing Pur. Date)
+                while buy_idx < len(buys):
+                    candidate = buys.loc[buy_idx]
+                    cand_pur = candidate[COL_PUR_DATE]
+                    # treat missing Pur. Date as available immediately (we set to 1900 earlier)
+                    if pd.isna(cand_pur) or cand_pur <= sell_date:
+                        # push into queue
+                        orig_buy_price = float(candidate.get(COL_PUR_PRICE) or 0.0)
+                        lot_qty = float(candidate.get(qty_col) or 0.0)
+                        lot_buy_date = candidate.get(COL_PUR_DATE)
+                        if lot_qty > 0:
+                            buy_queue.append({
+                                "qty": lot_qty,
+                                "orig_buy_price": orig_buy_price,
+                                "buy_date": lot_buy_date
+                            })
+                        buy_idx += 1
+                    else:
+                        # next candidate buy has pur_date > current sell_date, so stop adding for this sell
+                        break
 
-                if rtype.startswith("B"):  # BUY
-                    if qty > 0:
-                        # store original buy price separately (orig_buy_price) to preserve Capital Gain calc later
-                        orig_buy = float(buy_price) if pd.notna(buy_price) else 0.0
-                        buy_queue.append(
-                            {
-                                "qty": qty,
-                                "orig_buy_price": orig_buy,
-                                "buy_date": buy_date if pd.notna(buy_date) else pd.NaT,
-                            }
-                        )
+                qty_to_sell = sell_qty
 
-                elif rtype.startswith("S"):  # SELL
-                    qty_to_sell = qty
-                    if qty_to_sell <= 0 or pd.isna(sale_price) or pd.isna(sale_date):
-                        continue
+                # consume queued buys FIFO
+                while qty_to_sell > 0 and len(buy_queue) > 0:
+                    lot = buy_queue[0]
+                    take_qty = min(qty_to_sell, lot["qty"])
 
-                    # consume existing buys (FIFO). For ST/LT allocation, use adjusted cost if grandfathering is enabled.
-                    while qty_to_sell > 0 and len(buy_queue) > 0:
-                        lot = buy_queue[0]
-                        take_qty = min(qty_to_sell, lot["qty"])
+                    # adjusted cost for allocation (apply grandfathering if requested)
+                    adjusted_cost = lot["orig_buy_price"]
+                    row_fmv = find_fmv_for_row(srow)
+                    if apply_grandfather and row_fmv is not None:
+                        adjusted_cost = max(adjusted_cost, row_fmv)
+                    # NOTE: we DO NOT cap adjusted_cost at sale price — allow negative allocations
 
-                        # compute adjusted cost for allocation (do NOT cap at sale price so losses remain negative)
-                        adjusted_cost = lot["orig_buy_price"]
-                        if apply_grandfather and row_fmv is not None:
-                            adjusted_cost = max(adjusted_cost, row_fmv)
-                        # NOTE: we DO NOT min(adjusted_cost, sale_price) here — allow negative allocation
+                    gain_for_allocation = (float(sell_price) - adjusted_cost) * take_qty
 
-                        gain_for_allocation = (float(sale_price) - adjusted_cost) * take_qty
+                    # holding days per lot (sell_date - lot buy_date)
+                    hd = None
+                    if pd.notna(lot["buy_date"]) and pd.notna(sell_date):
+                        try:
+                            hd = int((sell_date - lot["buy_date"]).days)
+                        except Exception:
+                            hd = None
 
-                        # holding period per lot
-                        hd = None
-                        if pd.notna(lot["buy_date"]) and pd.notna(sale_date):
-                            try:
-                                hd = int((sale_date - lot["buy_date"]).days)
-                            except Exception:
-                                hd = None
+                    if hd is not None and hd > LONG_TERM_DAYS:
+                        lt_map[sell_orig_idx] += gain_for_allocation
+                    else:
+                        st_map[sell_orig_idx] += gain_for_allocation
 
-                        # allow negative numbers: allocate gain_for_allocation (can be negative)
-                        if hd is not None and hd > LONG_TERM_DAYS:
-                            lt_map[orig_idx] += gain_for_allocation
-                        else:
-                            st_map[orig_idx] += gain_for_allocation
+                    # reduce lot qty and remaining sell qty
+                    lot["qty"] -= take_qty
+                    qty_to_sell -= take_qty
 
-                        lot["qty"] -= take_qty
-                        qty_to_sell -= take_qty
-                        if lot["qty"] <= 0:
-                            buy_queue.pop(0)
+                    # pop lot if fully consumed
+                    if lot["qty"] <= 0:
+                        buy_queue.pop(0)
+                    else:
+                        buy_queue[0] = lot  # update remaining qty
 
-                    # unmatched sell qty (no buys) — allocate using row-level buy price (orig)
-                    if qty_to_sell > 0:
-                        orig_cost_basis = float(buy_price) if pd.notna(buy_price) else 0.0
-                        adjusted_cost = orig_cost_basis
-                        if apply_grandfather and row_fmv is not None:
-                            adjusted_cost = max(adjusted_cost, row_fmv)
-                        # DO NOT cap adjusted_cost at sale_price here
+                # If still qty_to_sell remains, try to include buys that have pur_date > sell_date? NO — we follow purchase-date rule.
+                # So unmatched qty falls back to using sell-row pur_price if present, else cost=0
+                if qty_to_sell > 0:
+                    orig_cost_basis = float(srow.get(COL_PUR_PRICE) or 0.0)
+                    adjusted_cost = orig_cost_basis
+                    row_fmv = find_fmv_for_row(srow)
+                    if apply_grandfather and row_fmv is not None:
+                        adjusted_cost = max(adjusted_cost, row_fmv)
+                    # allocate remaining
+                    gain_for_allocation = (float(sell_price) - adjusted_cost) * qty_to_sell
 
-                        gain_for_allocation = (float(sale_price) - adjusted_cost) * qty_to_sell
+                    # determine holding days: use sell-row Pur. Date vs Sale Date if present
+                    hd = None
+                    sell_row_buy_date = srow.get(COL_PUR_DATE)
+                    if pd.notna(sell_row_buy_date) and pd.notna(sell_date):
+                        try:
+                            hd = int((sell_date - sell_row_buy_date).days)
+                        except Exception:
+                            hd = None
 
-                        hd = None
-                        if pd.notna(buy_date) and pd.notna(sale_date):
-                            try:
-                                hd = int((sale_date - buy_date).days)
-                            except Exception:
-                                hd = None
+                    if hd is not None and hd > LONG_TERM_DAYS:
+                        lt_map[sell_orig_idx] += gain_for_allocation
+                    else:
+                        st_map[sell_orig_idx] += gain_for_allocation
 
-                        if hd is not None and hd > LONG_TERM_DAYS:
-                            lt_map[orig_idx] += gain_for_allocation
-                        else:
-                            st_map[orig_idx] += gain_for_allocation
+                    qty_to_sell = 0.0
 
-                        qty_to_sell = 0.0
-
-            # write back ST/LT using original indices
+            # write back ST/LT to df using original indices
             for idx_key, v in st_map.items():
                 df.loc[idx_key, COL_SHORT] = round(v, 2)
             for idx_key, v in lt_map.items():
@@ -276,15 +306,14 @@ def process_merged_dataframe(
 
 # ----------------- Streamlit UI -----------------
 st.set_page_config(
-    page_title="Capital Gain Calculator (with Grandfathering)",
+    page_title="Capital Gain Calculator (with Grandfathering, purchase-date FIFO)",
     layout="centered",
 )
 
 st.title("Capital Gain Calculator")
 st.write(
     "Upload one or more Excel/CSV files. "
-    "The app will merge them, apply FIFO (if BUY/SELL available) or simple per-row "
-    "calculation, and compute Short-Term and Long-Term capital gains. "
+    "The app will merge them, apply FIFO (BUY/SELL) matching by Purchase Date (Pur. Date) and compute Short-Term and Long-Term capital gains. "
     "Optionally, apply the Grandfathering clause using an FMV column present in your uploaded files (e.g. 'FMV Price on\\n31-Jan-2018')."
 )
 
@@ -295,7 +324,7 @@ apply_grandfather = st.checkbox(
     value=False,
 )
 
-# --- Main file uploader (no separate FMV mapping) ---
+# --- Main file uploader ---
 uploaded = st.file_uploader(
     "Select trade files to merge & process (Excel/CSV). FMV must be present in these files if you want grandfathering applied.",
     accept_multiple_files=True,
