@@ -6,6 +6,7 @@ import re
 
 # ----- Constants / Column names -----
 COL_ISIN = "ISIN"
+COL_TYPE = "Type"
 COL_SALE_DATE = "Sale Date"
 COL_PUR_DATE = "Pur. Date"
 COL_QTY = "Qty. Sold"
@@ -49,10 +50,13 @@ def process_merged_dataframe(
     apply_grandfather: bool = False,
 ) -> pd.DataFrame:
     """
-    Process merged dataframe:
-      - FIFO matching per ISIN: buys consumed by purchase-date FIFO
-      - Sells processed by sale-date ascending within each ISIN
-      - Output groups rows by ISIN and preserves FIFO_Sell_Order for arrange-by-sell-order
+    Merge-preserving FIFO matching by appearance order within each ISIN.
+    - Rows are processed in the same order they appear in the merged dataframe.
+    - For each ISIN: when a BUY row is encountered, push its lot to the FIFO buy_queue.
+      When a SELL row is encountered, consume from the buy_queue FIFO (only earlier buys).
+    - Capital Gain unchanged (sale - pur) * qty using original Pur. Price.
+    - ST/LT allocation uses adjusted cost (max(orig_buy_price, FMV)) if grandfathering enabled.
+    - Adjusted cost is NOT capped at sale price (so negative ST/LT allowed).
     """
     df = df.copy()
     df = normalize_column_names(df)
@@ -62,7 +66,7 @@ def process_merged_dataframe(
     qty_col = next((c for c in qty_col_candidates if c in df.columns), COL_QTY)
 
     # ensure required columns exist
-    for col in (COL_ISIN, COL_SALE_DATE, COL_PUR_DATE, qty_col, COL_SALE_PRICE, COL_PUR_PRICE):
+    for col in (COL_ISIN, COL_TYPE, COL_SALE_DATE, COL_PUR_DATE, qty_col, COL_SALE_PRICE, COL_PUR_PRICE):
         if col not in df.columns:
             df[col] = pd.NA
 
@@ -94,169 +98,135 @@ def process_merged_dataframe(
             cap_gain_list.append(round((float(sp) - float(pp)) * q, 2))
     df[COL_CAP_GAIN] = cap_gain_list
 
-    # normalize type if present
-    has_type = "Type" in df.columns
-    if has_type:
-        df["Type_norm"] = df["Type"].astype(str).str.strip().str.upper()
+    # normalize type column
+    df[COL_TYPE] = df.get(COL_TYPE).astype(str).fillna("").str.strip()
+    df["Type_norm"] = df[COL_TYPE].str.upper()
 
-    # global sell counter to assign FIFO order across all ISINs
+    # We'll process per ISIN, but keep the merged order.
+    # For each ISIN, iterate rows in merged order; add BUY lots when encountered; consume on SELL.
     global_sell_counter = 1
 
-    # ---------- FIFO per ISIN, sells ordered by sale date ascending ----------
-    if has_type:
-        # group by ISIN but preserve group order from sorted merged df
-        for isin, group in df.groupby(COL_ISIN, sort=False):
-            g = group.copy().reset_index()  # keep original index in 'index'
+    for isin, group in df.groupby(COL_ISIN, sort=False):
+        g = group.copy().reset_index()  # 'index' column preserves original df indices
 
-            # separate buys and sells
-            buys = g[g["Type_norm"].str.startswith("B", na=False)].copy()
-            sells = g[g["Type_norm"].str.startswith("S", na=False)].copy()
+        # buy_queue holds dicts: { qty, orig_buy_price, buy_date }
+        buy_queue = []
 
-            # For buys: sort by Pur. Date ascending (missing Pur. Date go last)
-            buys["_pur_sort"] = buys[COL_PUR_DATE].fillna(pd.Timestamp("9999-12-31"))
-            buys = buys.sort_values("_pur_sort").reset_index(drop=True)
+        # maps to accumulate ST/LT per original row index
+        st_map = {}
+        lt_map = {}
 
-            # For sells: sort by Sale Date ascending (missing Sale Date go last)
-            sells["_sale_sort"] = sells[COL_SALE_DATE].fillna(pd.Timestamp("9999-12-31"))
-            sells = sells.sort_values("_sale_sort").reset_index(drop=True)
+        # initialize maps for rows that are sells (so we can write back later)
+        for _, row in g.iterrows():
+            if str(row["Type_norm"]).startswith("S"):
+                st_map[int(row["index"])] = 0.0
+                lt_map[int(row["index"])] = 0.0
 
-            # buy queue (lots eligible to be consumed)
-            buy_queue = []
-            buy_idx = 0
+        # iterate rows in merged appearance order for this ISIN
+        for _, row in g.iterrows():
+            orig_idx = int(row["index"])
+            rtype = row["Type_norm"]
+            qty = float(row.get(qty_col) or 0.0)
+            sale_price = row.get(COL_SALE_PRICE)
+            buy_price = row.get(COL_PUR_PRICE)
+            sale_date = row.get(COL_SALE_DATE)
+            buy_date = row.get(COL_PUR_DATE)
 
-            # maps for accumulating ST/LT per sell original index
-            st_map = {}
-            lt_map = {}
+            # FMV for this row if present (we apply when allocating for sells)
+            row_fmv = find_fmv_for_row(row)
 
-            for _, srow in sells.iterrows():
-                st_map[int(srow["index"])] = 0.0
-                lt_map[int(srow["index"])] = 0.0
+            if rtype.startswith("B"):
+                # push buy lot in appearance order
+                if qty > 0:
+                    orig_buy = float(buy_price) if pd.notna(buy_price) else 0.0
+                    buy_queue.append({
+                        "qty": qty,
+                        "orig_buy_price": orig_buy,
+                        "buy_date": buy_date
+                    })
 
-            # process sells in sale-date order
-            for _, srow in sells.iterrows():
-                sell_idx = int(srow["index"])
-                sell_qty = float(srow.get(qty_col) or 0.0)
-                sell_price = srow.get(COL_SALE_PRICE)
-                sell_date = srow.get(COL_SALE_DATE)
-                if sell_qty <= 0 or pd.isna(sell_price) or pd.isna(sell_date):
+            elif rtype.startswith("S"):
+                # process sell: consume from buy_queue FIFO (only previous buys)
+                qty_to_sell = qty
+                if qty_to_sell <= 0 or pd.isna(sale_price):
+                    # nothing to do
                     continue
 
-                # add buys whose Pur. Date <= this sell's Sale Date (eligible buys)
-                while buy_idx < len(buys):
-                    cand = buys.loc[buy_idx]
-                    cand_pur = cand[COL_PUR_DATE]
-                    # missing pur date -> treat as unavailable for earlier sells (they were put last)
-                    if pd.isna(cand_pur):
-                        break
-                    if cand_pur <= sell_date:
-                        lot_qty = float(cand.get(qty_col) or 0.0)
-                        orig_buy_price = float(cand.get(COL_PUR_PRICE) or 0.0)
-                        lot_buy_date = cand.get(COL_PUR_DATE)
-                        if lot_qty > 0:
-                            buy_queue.append({"qty": lot_qty, "orig_buy_price": orig_buy_price, "buy_date": lot_buy_date})
-                        buy_idx += 1
-                    else:
-                        break
+                # ensure maps initialized
+                st_map.setdefault(orig_idx, 0.0)
+                lt_map.setdefault(orig_idx, 0.0)
 
-                qty_to_sell = sell_qty
-
-                # consume from buy_queue FIFO
                 while qty_to_sell > 0 and len(buy_queue) > 0:
                     lot = buy_queue[0]
-                    take = min(qty_to_sell, lot["qty"])
+                    take_qty = min(qty_to_sell, lot["qty"])
 
                     adjusted_cost = lot["orig_buy_price"]
-                    row_fmv = find_fmv_for_row(srow)
                     if apply_grandfather and row_fmv is not None:
                         adjusted_cost = max(adjusted_cost, row_fmv)
-                    # do NOT cap adjusted_cost at sale price (allow negative allocations)
+                    # DO NOT cap adjusted_cost at sale price — allow negative allocations
 
-                    alloc = (float(sell_price) - adjusted_cost) * take
+                    gain_for_allocation = (float(sale_price) - adjusted_cost) * take_qty
 
-                    # compute holding days
+                    # compute holding period relative to buy lot
                     hd = None
-                    if pd.notna(lot["buy_date"]) and pd.notna(sell_date):
+                    if pd.notna(lot["buy_date"]) and pd.notna(sale_date):
                         try:
-                            hd = int((sell_date - lot["buy_date"]).days)
+                            hd = int((sale_date - lot["buy_date"]).days)
                         except Exception:
                             hd = None
 
                     if hd is not None and hd > LONG_TERM_DAYS:
-                        lt_map[sell_idx] += alloc
+                        lt_map[orig_idx] += gain_for_allocation
                     else:
-                        st_map[sell_idx] += alloc
+                        st_map[orig_idx] += gain_for_allocation
 
-                    # update quantities
-                    lot["qty"] -= take
-                    qty_to_sell -= take
+                    # reduce quantities
+                    lot["qty"] -= take_qty
+                    qty_to_sell -= take_qty
 
                     if lot["qty"] <= 0:
                         buy_queue.pop(0)
                     else:
                         buy_queue[0] = lot
 
-                # remaining unmatched qty -> fallback to sell-row pur price if present
+                # If still some qty remains (no earlier buys to match), fallback to using this sell row's pur price
                 if qty_to_sell > 0:
-                    fallback_cost = float(srow.get(COL_PUR_PRICE) or 0.0)
-                    adjusted_cost = fallback_cost
-                    row_fmv = find_fmv_for_row(srow)
+                    orig_cost_basis = float(buy_price) if pd.notna(buy_price) else 0.0
+                    adjusted_cost = orig_cost_basis
                     if apply_grandfather and row_fmv is not None:
                         adjusted_cost = max(adjusted_cost, row_fmv)
 
-                    alloc = (float(sell_price) - adjusted_cost) * qty_to_sell
+                    gain_for_allocation = (float(sale_price) - adjusted_cost) * qty_to_sell
 
+                    # determine holding days using sell-row Pur. Date if present
                     hd = None
-                    sell_row_buy_date = srow.get(COL_PUR_DATE)
-                    if pd.notna(sell_row_buy_date) and pd.notna(sell_date):
+                    if pd.notna(buy_date) and pd.notna(sale_date):
                         try:
-                            hd = int((sell_date - sell_row_buy_date).days)
+                            hd = int((sale_date - buy_date).days)
                         except Exception:
                             hd = None
 
                     if hd is not None and hd > LONG_TERM_DAYS:
-                        lt_map[sell_idx] += alloc
+                        lt_map[orig_idx] += gain_for_allocation
                     else:
-                        st_map[sell_idx] += alloc
+                        st_map[orig_idx] += gain_for_allocation
 
                     qty_to_sell = 0.0
 
-                # assign global FIFO sell order for this sell
-                df.loc[sell_idx, COL_FIFO_SELL_ORDER] = global_sell_counter
+                # assign FIFO sell order in processing sequence
+                df.loc[orig_idx, COL_FIFO_SELL_ORDER] = global_sell_counter
                 global_sell_counter += 1
 
-            # write back ST/LT into df using original indices
-            for idx_key, v in st_map.items():
-                df.loc[idx_key, COL_SHORT] = round(v, 2)
-            for idx_key, v in lt_map.items():
-                df.loc[idx_key, COL_LONG] = round(v, 2)
-
-        # cleanup helper cols if any
-        df = df.drop(columns=["Type_norm", "_pur_sort", "_sale_sort"], errors="ignore")
-
-    else:
-        # simple per-row mode: allocate by row's holding days
-        short_list = []
-        long_list = []
-        for _, row in df.iterrows():
-            q = float(row.get(qty_col) or 0.0)
-            sp = row.get(COL_SALE_PRICE)
-            pp = row.get(COL_PUR_PRICE)
-            hd = row.get("Holding Days")
-            if q == 0 or pd.isna(sp) or pd.isna(pp):
-                short_list.append(0.0); long_list.append(0.0); continue
-            row_fmv = find_fmv_for_row(row)
-            adjusted_cost = float(pp)
-            if apply_grandfather and row_fmv is not None:
-                adjusted_cost = max(adjusted_cost, row_fmv)
-            gain_for_allocation = (float(sp) - adjusted_cost) * q
-            if pd.notna(hd) and hd > LONG_TERM_DAYS:
-                short_val, long_val = 0.0, gain_for_allocation
             else:
-                short_val, long_val = gain_for_allocation, 0.0
-            short_list.append(round(short_val, 2))
-            long_list.append(round(long_val, 2))
-        df[COL_SHORT] = short_list
-        df[COL_LONG] = long_list
+                # row with no Type: treat as per-row simple calculation; no FIFO matching
+                # (we already computed Capital Gain earlier)
+                pass
+
+        # after processing group, write back ST/LT into original dataframe rows
+        for idx_key, val in st_map.items():
+            df.loc[idx_key, COL_SHORT] = round(val, 2)
+        for idx_key, val in lt_map.items():
+            df.loc[idx_key, COL_LONG] = round(val, 2)
 
     # format dates for output
     for col in [COL_SALE_DATE, COL_PUR_DATE]:
@@ -266,12 +236,13 @@ def process_merged_dataframe(
 
 
 # ----------------- Streamlit UI -----------------
-st.set_page_config(page_title="Capital Gain Calculator (grouped by ISIN, sale-date FIFO)", layout="centered")
+st.set_page_config(page_title="Capital Gain Calculator (FIFO by appearance order)", layout="centered")
 
 st.title("Capital Gain Calculator")
 st.write(
-    "Upload Excel/CSV files. The app will merge them, group rows by ISIN, sort sells by Sale Date ascending within each ISIN, "
-    "and apply FIFO (purchase-date) for allocation. Optional FMV (31-Jan-2018) must be present in uploaded files to apply grandfathering."
+    "Upload one or more Excel/CSV files. The app will merge them (preserving file/row order), "
+    "and for each asset (ISIN) it will apply strict FIFO matching by appearance order within that asset: "
+    "a SELL consumes earlier BUY lots only; the next BUY is used only after earlier lots are fully sold."
 )
 
 # Grandfathering control
@@ -296,49 +267,33 @@ if uploaded:
             d = normalize_column_names(d)
             dfs.append(d)
 
+        # merge preserving upload/file row order
         merged = pd.concat(dfs, ignore_index=True)
 
-        # --- IMPORTANT ORDERING: group by ISIN and within group sort by Sale Date ascending ---
-        # parse dates to sort
-        merged[COL_SALE_DATE] = pd.to_datetime(merged.get(COL_SALE_DATE), errors="coerce")
-        merged[COL_PUR_DATE] = pd.to_datetime(merged.get(COL_PUR_DATE), errors="coerce")
-
-        # sort by ISIN ascending then Sale Date ascending (missing Sale Date placed last), then Pur. Date ascending
-        merged = merged.sort_values(by=[COL_ISIN, COL_SALE_DATE, COL_PUR_DATE], na_position="last").reset_index(drop=True)
-
-        st.subheader("Merged (grouped by ISIN; sells sorted by Sale Date asc) preview")
+        st.subheader("Merged preview (original order preserved)")
         st.dataframe(merged.head(120))
 
         if st.button("Process & Download Excel"):
-            # check FMV presence
+            # check for FMV presence if grandfathering requested
             merged_fmv_cols = [c for c in merged.columns if c in FMV_CANDIDATES]
             if apply_grandfather and (not merged_fmv_cols):
                 st.warning("Grandfathering selected but no FMV column found; processing will continue without FMV.")
 
             result_df = process_merged_dataframe(merged, apply_grandfather=apply_grandfather)
 
-            st.subheader("Processed preview (grouped by ISIN; sells sorted by FIFO_Sell_Order)")
+            st.subheader("Processed preview")
             st.dataframe(result_df.head(200))
 
-            # show sells arranged by FIFO_Sell_Order first (so you can inspect matched sells in order)
-            sells_sorted = result_df[result_df[COL_FIFO_SELL_ORDER].notna()].sort_values(by=[COL_ISIN, COL_FIFO_SELL_ORDER])
-            others = result_df[result_df[COL_FIFO_SELL_ORDER].isna()]
-            arranged = pd.concat([sells_sorted, others], ignore_index=True)
-
-            st.markdown("**Sells (by ISIN, FIFO sell order)**")
-            st.dataframe(sells_sorted.head(200))
-
-            # prepare Excel with two sheets: full processed and sells-first arranged
+            # prepare Excel for download (Processed sheet)
             output = BytesIO()
             with pd.ExcelWriter(output, engine="openpyxl") as writer:
                 result_df.to_excel(writer, index=False, sheet_name="Processed")
-                arranged.to_excel(writer, index=False, sheet_name="Sells_First_By_FIFO")
             output.seek(0)
 
             st.download_button(
                 label="Download Processed.xlsx",
                 data=output,
-                file_name="Processed_with_FIFO.xlsx",
+                file_name="Processed_FIFO_by_order.xlsx",
                 mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
             )
 
