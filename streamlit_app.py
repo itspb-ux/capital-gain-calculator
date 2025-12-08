@@ -4,7 +4,6 @@ import pandas as pd
 from io import BytesIO
 import re
 
-
 # ------- CONSTANTS -------
 COL_ISIN = "ISIN"
 COL_TYPE = "Type"
@@ -33,7 +32,7 @@ FMV_CANDIDATES = [
 
 # ---------------- HELPERS ----------------
 
-def normalize_column_names(df):
+def normalize_column_names(df: pd.DataFrame) -> pd.DataFrame:
     df.columns = [re.sub(r"\s+", " ", str(c)).strip() for c in df.columns]
     return df
 
@@ -43,14 +42,22 @@ def find_fmv_for_row(row):
         if c in row.index and pd.notna(row[c]):
             try:
                 return float(row[c])
-            except:
+            except Exception:
                 pass
     return None
 
 
 # ---------------- FIFO ENGINE ----------------
 
-def process_merged_dataframe(df, apply_grandfather=False):
+def process_merged_dataframe(df: pd.DataFrame, apply_grandfather: bool = False) -> pd.DataFrame:
+    """
+    Process merged dataframe:
+      - FIFO per ISIN using appearance order (buys appended, sells consume earlier buys).
+      - ST/LT allocation uses adjusted cost (max(orig_buy_price, FMV) if grandfathering enabled).
+      - Capital Gain always computed as (Sale Price - Pur. Price) * Qty.
+      - Returns data frame with ST, LT, CAP_GAIN, FIFO_Sell_Order, ISIN_Completion_Order.
+      - IMPORTANT: dates remain as datetime objects (no strftime).
+    """
     df = df.copy()
     df = normalize_column_names(df)
 
@@ -59,139 +66,160 @@ def process_merged_dataframe(df, apply_grandfather=False):
     qty_col = next((c for c in qty_candidates if c in df.columns), COL_QTY)
 
     # ensure required columns exist
-    for c in (COL_ISIN, COL_TYPE, COL_SALE_DATE, COL_PUR_DATE,
-              qty_col, COL_SALE_PRICE, COL_PUR_PRICE):
+    for c in (COL_ISIN, COL_TYPE, COL_SALE_DATE, COL_PUR_DATE, qty_col, COL_SALE_PRICE, COL_PUR_PRICE):
         if c not in df.columns:
             df[c] = pd.NA
 
     # parsing
-    df[COL_TYPE] = df[COL_TYPE].astype(str).fillna("").str.strip()
+    df[COL_TYPE] = df.get(COL_TYPE).astype(str).fillna("").str.strip()
     df["Type_norm"] = df[COL_TYPE].str.upper()
-
-    df[COL_PUR_DATE] = pd.to_datetime(df[COL_PUR_DATE], errors="coerce")
-    df[COL_SALE_DATE] = pd.to_datetime(df[COL_SALE_DATE], errors="coerce")
-
-    df[qty_col] = pd.to_numeric(df[qty_col], errors="coerce").fillna(0.0)
-    df[COL_SALE_PRICE] = pd.to_numeric(df[COL_SALE_PRICE], errors="coerce")
-    df[COL_PUR_PRICE] = pd.to_numeric(df[COL_PUR_PRICE], errors="coerce")
+    df[COL_PUR_DATE] = pd.to_datetime(df.get(COL_PUR_DATE), errors="coerce")
+    df[COL_SALE_DATE] = pd.to_datetime(df.get(COL_SALE_DATE), errors="coerce")
+    df[qty_col] = pd.to_numeric(df.get(qty_col), errors="coerce").fillna(0.0)
+    df[COL_SALE_PRICE] = pd.to_numeric(df.get(COL_SALE_PRICE), errors="coerce")
+    df[COL_PUR_PRICE] = pd.to_numeric(df.get(COL_PUR_PRICE), errors="coerce")
 
     df["Holding Days"] = (df[COL_SALE_DATE] - df[COL_PUR_DATE]).dt.days
 
-    # outputs
+    # outputs initialization
     df[COL_SHORT] = 0.0
     df[COL_LONG] = 0.0
     df[COL_CAP_GAIN] = 0.0
     df[COL_FIFO_SELL_ORDER] = pd.NA
     df[COL_ISIN_COMPLETE] = pd.NA
 
-    # capital gain = (sale - pur) * qty
+    # Capital gain = (sale - pur) * qty (uses original Pur. Price)
     capgains = []
     for _, row in df.iterrows():
-        q = float(row[qty_col] or 0)
-        sp = row[COL_SALE_PRICE]
-        pp = row[COL_PUR_PRICE]
+        q = float(row.get(qty_col) or 0.0)
+        sp = row.get(COL_SALE_PRICE)
+        pp = row.get(COL_PUR_PRICE)
         if q and pd.notna(sp) and pd.notna(pp):
             capgains.append(round((float(sp) - float(pp)) * q, 2))
         else:
             capgains.append(0.0)
     df[COL_CAP_GAIN] = capgains
 
-    # ---------- FIFO per ISIN ----------
+    # FIFO per ISIN in grouped order (appearance order preserved by groupby sort=False)
     global_sell_counter = 1
     isin_completion = {}
 
     for isin, group in df.groupby(COL_ISIN, sort=False):
-        g = group.copy().reset_index()
+        g = group.copy().reset_index()  # original index in 'index'
         buy_queue = []
-        bought = 0.0
-        sold = 0.0
+        cumulative_bought = 0.0
+        cumulative_sold = 0.0
         completed = False
 
         for _, row in g.iterrows():
-            idx = int(row["index"])
-            qty = float(row[qty_col] or 0.0)
+            orig_idx = int(row["index"])
             rtype = row["Type_norm"]
-            sale_price = row[COL_SALE_PRICE]
-            buy_price = row[COL_PUR_PRICE]
-            sale_date = row[COL_SALE_DATE]
-            buy_date = row[COL_PUR_DATE]
+            qty = float(row.get(qty_col) or 0.0)
+            sale_price = row.get(COL_SALE_PRICE)
+            buy_price = row.get(COL_PUR_PRICE)
+            sale_date = row.get(COL_SALE_DATE)
+            buy_date = row.get(COL_PUR_DATE)
             row_fmv = find_fmv_for_row(row)
 
-            if rtype.startswith("B"):     # BUY
+            if rtype.startswith("B"):
                 if qty > 0:
                     buy_queue.append({
                         "qty": qty,
                         "orig_buy_price": float(buy_price) if pd.notna(buy_price) else 0.0,
                         "buy_date": buy_date
                     })
-                    bought += qty
+                    cumulative_bought += qty
 
-            elif rtype.startswith("S"):   # SELL
-                remaining = qty
+            elif rtype.startswith("S"):
+                qty_to_sell = qty
+                if qty_to_sell <= 0 or pd.isna(sale_price):
+                    # still assign FIFO sell order (even if zero) and update sold qty
+                    df.loc[orig_idx, COL_FIFO_SELL_ORDER] = global_sell_counter
+                    global_sell_counter += 1
+                    cumulative_sold += qty_to_sell
+                    if not completed and cumulative_bought > 0 and cumulative_sold >= cumulative_bought:
+                        isin_completion[isin] = df.loc[orig_idx, COL_FIFO_SELL_ORDER]
+                        completed = True
+                    continue
 
-                # consume FIFO buys
-                while remaining > 0 and buy_queue:
+                remaining = qty_to_sell
+
+                # consume earlier buys FIFO
+                while remaining > 0 and len(buy_queue) > 0:
                     lot = buy_queue[0]
                     take = min(remaining, lot["qty"])
 
-                    adj_cost = lot["orig_buy_price"]
+                    adjusted_cost = lot["orig_buy_price"]
                     if apply_grandfather and row_fmv is not None:
-                        adj_cost = max(adj_cost, row_fmv)
+                        adjusted_cost = max(adjusted_cost, row_fmv)
 
-                    alloc = (float(sale_price) - adj_cost) * take
+                    alloc_amount = (float(sale_price) - adjusted_cost) * take
 
-                    # ST/LT
+                    # compute holding days relative to lot buy date
                     hd = None
                     if pd.notna(lot["buy_date"]) and pd.notna(sale_date):
-                        hd = int((sale_date - lot["buy_date"]).days)
+                        try:
+                            hd = int((sale_date - lot["buy_date"]).days)
+                        except Exception:
+                            hd = None
 
-                    if hd and hd > LONG_TERM_DAYS:
-                        df.loc[idx, COL_LONG] += round(alloc, 2)
+                    if hd is not None and hd > LONG_TERM_DAYS:
+                        df.loc[orig_idx, COL_LONG] = round(df.loc[orig_idx, COL_LONG] + alloc_amount, 2)
                     else:
-                        df.loc[idx, COL_SHORT] += round(alloc, 2)
+                        df.loc[orig_idx, COL_SHORT] = round(df.loc[orig_idx, COL_SHORT] + alloc_amount, 2)
 
                     lot["qty"] -= take
                     remaining -= take
-                    sold += take
+                    cumulative_sold += take
 
                     if lot["qty"] <= 0:
                         buy_queue.pop(0)
+                    else:
+                        buy_queue[0] = lot
 
-                # unmatched qty -> fallback to row's purchase price
+                # any unmatched qty falls back to sell-row Pur. Price
                 if remaining > 0:
-                    adj = float(buy_price) if pd.notna(buy_price) else 0.0
+                    fallback_cost = float(buy_price) if pd.notna(buy_price) else 0.0
+                    adjusted_cost = fallback_cost
                     if apply_grandfather and row_fmv is not None:
-                        adj = max(adj, row_fmv)
+                        adjusted_cost = max(adjusted_cost, row_fmv)
 
-                    alloc = (float(sale_price) - adj) * remaining
+                    alloc_amount = (float(sale_price) - adjusted_cost) * remaining
 
                     hd = None
                     if pd.notna(buy_date) and pd.notna(sale_date):
-                        hd = int((sale_date - buy_date).days)
+                        try:
+                            hd = int((sale_date - buy_date).days)
+                        except Exception:
+                            hd = None
 
-                    if hd and hd > LONG_TERM_DAYS:
-                        df.loc[idx, COL_LONG] += round(alloc, 2)
+                    if hd is not None and hd > LONG_TERM_DAYS:
+                        df.loc[orig_idx, COL_LONG] = round(df.loc[orig_idx, COL_LONG] + alloc_amount, 2)
                     else:
-                        df.loc[idx, COL_SHORT] += round(alloc, 2)
+                        df.loc[orig_idx, COL_SHORT] = round(df.loc[orig_idx, COL_SHORT] + alloc_amount, 2)
 
-                    sold += remaining
-                    remaining = 0
+                    cumulative_sold += remaining
+                    remaining = 0.0
 
-                # assign global FIFO sell index
-                df.loc[idx, COL_FIFO_SELL_ORDER] = global_sell_counter
-                this_sell = global_sell_counter
+                # assign FIFO sell order (global sequence)
+                df.loc[orig_idx, COL_FIFO_SELL_ORDER] = global_sell_counter
+                sell_order_now = global_sell_counter
                 global_sell_counter += 1
 
                 # completion check
-                if not completed and bought > 0 and sold >= bought:
-                    isin_completion[isin] = this_sell
+                if not completed and cumulative_bought > 0 and cumulative_sold >= cumulative_bought:
+                    isin_completion[isin] = sell_order_now
                     completed = True
 
+            else:
+                # no Type / unknown: skip FIFO matching (row left as-is)
+                pass
+
+        # write completion order for all rows of this ISIN
         df.loc[df[COL_ISIN] == isin, COL_ISIN_COMPLETE] = isin_completion.get(isin, pd.NA)
 
-    # final date formatting
-    df[COL_PUR_DATE] = pd.to_datetime(df[COL_PUR_DATE], errors="coerce").dt.strftime("%d/%m/%Y")
-    df[COL_SALE_DATE] = pd.to_datetime(df[COL_SALE_DATE], errors="coerce").dt.strftime("%d/%m/%Y")
+    # IMPORTANT: we keep date columns as datetimes (do not convert to strings)
+    # Caller/UI will format/display as needed; Excel writer will be instructed to keep datetime format.
 
     return df
 
@@ -210,8 +238,11 @@ if uploaded:
     try:
         dfs = []
         for f in uploaded:
-            df = pd.read_csv(f) if f.name.lower().endswith(".csv") else pd.read_excel(f)
-            dfs.append(normalize_column_names(df))
+            if f.name.lower().endswith(".csv"):
+                d = pd.read_csv(f)
+            else:
+                d = pd.read_excel(f)
+            dfs.append(normalize_column_names(d))
 
         merged = pd.concat(dfs, ignore_index=True)
 
@@ -221,25 +252,23 @@ if uploaded:
         if st.button("Process & Download"):
             result = process_merged_dataframe(merged, apply_grandfather)
 
-            # ⭐ FINAL SORTING RULE ⭐
-            # 1. Keep ISIN groups together
-            # 2. Sort inside each ISIN by SALE DATE ascending
-            result["_orig"] = result.index
+            # FINAL SORT: keep ISIN groups together; inside each ISIN sort by Sale Date ascending (then original order)
+            result["_orig_order"] = result.index
             result[COL_SALE_DATE] = pd.to_datetime(result[COL_SALE_DATE], errors="coerce")
 
             result = result.sort_values(
-                by=[COL_ISIN, COL_SALE_DATE, "_orig"],
+                by=[COL_ISIN, COL_SALE_DATE, "_orig_order"],
                 na_position="last"
             ).reset_index(drop=True)
 
-            result = result.drop(columns=["_orig"], errors="ignore")
+            result = result.drop(columns=["_orig_order"], errors="ignore")
 
             st.subheader("Final Output (Assets Together, Sale-Date ASC)")
             st.dataframe(result.head(200))
 
-            # download file
+            # Export to Excel while preserving datetime cells (Excel will see proper dates)
             output = BytesIO()
-            with pd.ExcelWriter(output, engine="openpyxl") as writer:
+            with pd.ExcelWriter(output, engine="openpyxl", datetime_format="DD-MMM-YYYY") as writer:
                 result.to_excel(writer, index=False, sheet_name="Processed")
             output.seek(0)
 
